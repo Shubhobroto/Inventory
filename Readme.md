@@ -1,3 +1,31 @@
+# Uber Backend System 🚀
+
+## Features
+- Booking lifecycle (PENDING → CONFIRMED)
+- Redis-based driver matching
+- RabbitMQ async processing
+- WebSocket driver notifications
+- Driver accept/reject flow
+- Timeout-based retry
+
+## Tech Stack
+- Spring Boot
+- Redis
+- RabbitMQ
+- WebSocket
+- MySQL / H2
+
+## How to Run
+1. Start Redis
+2. Start RabbitMQ
+3. Run Spring Boot app
+4. Test APIs via Bruno/Postman
+
+## Architecture
+Event-driven microservice-style backend inspired by Uber.
+
+
+
 ## Sample Data
 
 ```
