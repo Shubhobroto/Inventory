@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background: #fbfbfd;
+    color: #1d1d1f;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Tailwind v4 resets buttons to the default arrow cursor; every clickable control should show the hand. */
+  button:not(:disabled),
+  select,
+  a,
+  label:has(input) {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+}
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 rgba(0, 113, 227, 0.35); }
+  100% { box-shadow: 0 0 0 14px rgba(0, 113, 227, 0); }
+}
+
+.pulse-ring {
+  animation: pulse-ring 1.2s ease-out infinite;
+}
+
+@keyframes bag-bounce {
+  0%, 100% { transform: scale(1); }
+  40% { transform: scale(1.25); }
+}
+
+.bag-bounce {
+  animation: bag-bounce 0.45s ease-out;
+}
