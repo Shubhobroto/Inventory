@@ -44,6 +44,8 @@ cd payment-service   && ./gradlew bootRun
 
 Demo data: stock `SKU-1` 100, `SKU-2` 5, `SKU-3` 0; wallets `CUST-1` 1000.00, `CUST-2` 10.00.
 
+gtcgucgtuc
+
 ```
 # happy path
 curl -X POST localhost:8081/orders -H "Content-Type: application/json" -H "Idempotency-Key: demo-1" \
