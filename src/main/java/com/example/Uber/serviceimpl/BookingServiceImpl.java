@@ -1,29 +1,33 @@
 package com.example.Uber.serviceimpl;
 
-import com.example.Uber.configuration.RabbitMQConfig;
 import com.example.Uber.dto.BookingRequest;
 import com.example.Uber.dto.BookingResponse;
 import com.example.Uber.entity.Booking;
 import com.example.Uber.entity.Driver;
 import com.example.Uber.entity.Passenger;
+import com.example.Uber.event.BookingCreatedEvent;
 import com.example.Uber.mapper.BookingMapper;
 import com.example.Uber.repository.BookingRepository;
 import com.example.Uber.repository.DriverRepository;
 import com.example.Uber.repository.PassengerRepository;
 import com.example.Uber.service.BookingService;
+import com.example.Uber.service.MatchingService;
 import com.example.Uber.service.NotificationService;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import com.example.Uber.event.RideRequestEvent;
-import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 @Transactional
@@ -33,9 +37,13 @@ public class BookingServiceImpl implements BookingService {
     private final PassengerRepository passengerRepository;
     private final DriverRepository driverRepository;
     private final BookingMapper bookingMapper;
-    private final RabbitTemplate rabbitTemplate;
+    private final ApplicationEventPublisher eventPublisher;
     private final StringRedisTemplate redisTemplate;
     private final NotificationService notificationService;
+    private final MatchingService matchingService;
+    private final OfferDeadlineStore offerDeadlines;
+    private final DriverReservationStore driverReservations;
+    private final MeterRegistry meterRegistry;
 
 
     @Override
@@ -104,13 +112,9 @@ public class BookingServiceImpl implements BookingService {
         // 5. Save booking
         Booking savedBooking = bookingRepository.save(booking);
 
-        rabbitTemplate.convertAndSend(
-                RabbitMQConfig.QUEUE,
-                new RideRequestEvent(savedBooking.getId())
-        );
-
-        // 6. CALL MATCHING SERVICE (IMPORTANT) but will be pushed to RABBITMQ
-//        matchingService.matchDriver(savedBooking.getId());
+        // 6. Matching runs asynchronously: the request is published to RabbitMQ only after this transaction
+        //    commits, and the rider immediately gets the PENDING booking back.
+        eventPublisher.publishEvent(new BookingCreatedEvent(savedBooking.getId()));
 
         // 7. Return response
         return bookingMapper.toResponse(savedBooking);
@@ -165,61 +169,78 @@ public class BookingServiceImpl implements BookingService {
     @Override
     public Boolean acceptRide(Long bookingId, Long driverId) {
 
-        // 1. Check if this driver is the current eligible driver
-        String currentDriver = redisTemplate.opsForValue()
-                .get("ride:" + bookingId + ":current");
-
+        // 1. Only the driver who currently holds the offer may answer it
+        String currentDriver = redisTemplate.opsForValue().get(currentKey(bookingId));
         if (currentDriver == null || !currentDriver.equals(driverId.toString())) {
-            System.out.println("❌ Not your turn or timeout");
+            log.info("Accept ignored, not this driver's offer bookingId={} driverId={}", bookingId, driverId);
             return false;
         }
 
-        // 2. Fetch driver
-        Driver driver = driverRepository.findById(driverId)
-                .orElseThrow(() -> new IllegalArgumentException("Driver not found"));
-
-        // 3. Atomic DB update (race condition safe)
-        int updatedRows = bookingRepository.assignDriverIfPending(bookingId, driver);
-
-        if (updatedRows == 0) {
-            System.out.println("❌ Ride already accepted by another driver");
+        // 2. Accept, reject and timeout race for the same offer; the atomic claim lets exactly one of them win
+        if (!offerDeadlines.claim(bookingId)) {
+            log.info("Accept too late, offer already expired or answered bookingId={} driverId={}", bookingId, driverId);
             return false;
         }
 
-        // 4. SUCCESS → clean Redis state
-        redisTemplate.delete("ride:" + bookingId + ":current");
-        redisTemplate.delete("ride:" + bookingId + ":drivers");
+        try {
+            Driver driver = driverRepository.findById(driverId)
+                    .orElseThrow(() -> new IllegalArgumentException("Driver not found"));
 
-        // 5. (Optional but IMPORTANT) notify rider
-        notificationService.sendBookingUpdate(
-                bookingId,
-                "CONFIRMED"
-        );
+            // 3. Take the driver first: if another booking already assigned them, hand this offer on.
+            if (driverRepository.markBusyIfAvailable(driverId) == 0) {
+                log.info("Driver already busy with another ride bookingId={} driverId={}", bookingId, driverId);
+                matchingService.notifyNextDriver(bookingId);
+                return false;
+            }
 
-        System.out.println("✅ Driver " + driverId + " successfully assigned");
-        driver.setIsAvailable(false);
-        driverRepository.save(driver);
+            // 4. Atomic DB update: the second line of defence against double assignment of the booking
+            int updatedRows = bookingRepository.assignDriverIfPending(bookingId, driver);
+            if (updatedRows == 0) {
+                log.info("Booking no longer pending bookingId={}", bookingId);
+                driverRepository.markAvailable(driverId);
+                driverReservations.release(driverId, bookingId);
+                redisTemplate.delete(List.of(currentKey(bookingId), driversKey(bookingId)));
+                return false;
+            }
 
-        return true;
+            notificationService.sendBookingUpdate(bookingId, "CONFIRMED");
+
+            redisTemplate.delete(List.of(currentKey(bookingId), driversKey(bookingId)));
+            driverReservations.release(driverId, bookingId);
+            meterRegistry.counter("matching.sessions", "result", "matched").increment();
+            log.info("Driver assigned bookingId={} driverId={}", bookingId, driverId);
+            return true;
+        } catch (RuntimeException e) {
+            // The transaction rolls back, so the booking is still PENDING: hand the offer back so the
+            // timeout job moves it on to the next driver instead of leaving the booking stuck.
+            offerDeadlines.schedule(bookingId, Duration.ZERO);
+            throw e;
+        }
     }
 
     @Override
     public void rejectRide(Long bookingId, Long driverId) {
 
-        String currentDriver = redisTemplate.opsForValue()
-                .get("ride:" + bookingId + ":current");
-
-        // only current driver can reject
+        String currentDriver = redisTemplate.opsForValue().get(currentKey(bookingId));
         if (currentDriver == null || !currentDriver.equals(driverId.toString())) {
-            System.out.println("❌ Not your turn to reject");
+            log.info("Reject ignored, not this driver's offer bookingId={} driverId={}", bookingId, driverId);
             return;
         }
 
-        System.out.println("❌ Driver " + driverId + " rejected booking " + bookingId);
+        // If the timeout job already claimed this offer, it is moving on by itself; do not advance twice.
+        if (!offerDeadlines.claim(bookingId)) {
+            return;
+        }
 
-        // remove current driver key → triggers next driver
-        redisTemplate.delete("ride:" + bookingId + ":current");
+        log.info("Driver rejected bookingId={} driverId={}", bookingId, driverId);
+        matchingService.notifyNextDriver(bookingId);
     }
 
+    private static String currentKey(Long bookingId) {
+        return "ride:" + bookingId + ":current";
+    }
 
+    private static String driversKey(Long bookingId) {
+        return "ride:" + bookingId + ":drivers";
+    }
 }

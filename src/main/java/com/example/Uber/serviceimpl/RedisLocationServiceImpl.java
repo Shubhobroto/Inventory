@@ -2,84 +2,154 @@ package com.example.Uber.serviceimpl;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
-import org.springframework.data.geo.Circle;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
 import org.springframework.data.geo.GeoResults;
 import org.springframework.data.geo.Metrics;
 import org.springframework.data.geo.Point;
-import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.connection.RedisGeoCommands.GeoLocation;
-import org.springframework.data.redis.core.GeoOperations;
+import org.springframework.data.redis.connection.RedisGeoCommands.GeoSearchCommandArgs;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.domain.geo.GeoReference;
+import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.stereotype.Service;
 
+import com.example.Uber.configuration.MatchingProperties;
 import com.example.Uber.dto.DriverLocationDTO;
 import com.example.Uber.service.LocationService;
 
-import lombok.RequiredArgsConstructor;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 
+/**
+ * Driver positions live in two Redis structures:
+ * <ul>
+ *   <li>{@code driver:geo}  - GEO set (a sorted set under the hood, score = 52-bit geohash). GEOSEARCH
+ *       returns members inside a radius, already sorted by distance, in one round trip.</li>
+ *   <li>{@code driver:seen} - sorted set of last-update time per driver. GEO members cannot have a TTL,
+ *       so this is how offline drivers are found and removed.</li>
+ * </ul>
+ */
 @Service
-@RequiredArgsConstructor
 public class RedisLocationServiceImpl implements LocationService {
 
-    private static final String DRIVER_GEO_OPS_KEY = "driver:geo"; // represent location of driver entity in redis
+    static final String GEO_KEY = "driver:geo";
+    static final String SEEN_KEY = "driver:seen";
 
-    private final StringRedisTemplate stringRedisTemplate;
+    // Redis GEO only accepts latitudes inside the Web Mercator range.
+    private static final double MAX_LATITUDE = 85.05112878;
+    private static final int EVICTION_BATCH_SIZE = 500;
 
+    private final StringRedisTemplate redis;
+    private final MatchingProperties props;
+    private final Timer searchTimer;
+    private final Timer writeTimer;
+
+    public RedisLocationServiceImpl(StringRedisTemplate redis, MatchingProperties props, MeterRegistry registry) {
+        this.redis = redis;
+        this.props = props;
+        this.searchTimer = Timer.builder("matching.geo.search")
+                .description("Redis GEOSEARCH latency for one nearby-driver query")
+                .publishPercentileHistogram()
+                .register(registry);
+        this.writeTimer = Timer.builder("matching.geo.write")
+                .description("Latency of one driver location update (GEOADD + ZADD, pipelined)")
+                .publishPercentileHistogram()
+                .register(registry);
+    }
 
     @Override
     public Boolean saveDriverLocation(Integer driverId, Double latitude, Double longitude) {
+        requireValidCoordinates(latitude, longitude);
+        if (driverId == null) {
+            throw new IllegalArgumentException("driverId is required");
+        }
 
-        GeoOperations<String, String> geoOperations = stringRedisTemplate.opsForGeo();
+        RedisSerializer<String> serializer = redis.getStringSerializer();
+        byte[] geoKey = serializer.serialize(GEO_KEY);
+        byte[] seenKey = serializer.serialize(SEEN_KEY);
+        byte[] member = serializer.serialize(driverId.toString());
+        double now = System.currentTimeMillis();
 
-        geoOperations.add(DRIVER_GEO_OPS_KEY,
-                new RedisGeoCommands.GeoLocation<>(driverId.toString(), new Point(longitude, latitude))
-        );
-
+        // One round trip for both writes; drivers ping every few seconds, so this is the hot write path.
+        writeTimer.record(() -> redis.executePipelined((RedisCallback<Object>) connection -> {
+            connection.geoCommands().geoAdd(geoKey, new Point(longitude, latitude), member);
+            connection.zSetCommands().zAdd(seenKey, now, member);
+            return null;
+        }));
         return true;
     }
 
     @Override
-    public List<DriverLocationDTO> getNearbyDrivers(Double latitude, Double longitude, Double radius) {
-        GeoOperations<String, String> geoOperations = stringRedisTemplate.opsForGeo();
+    public List<DriverLocationDTO> getNearbyDrivers(Double latitude, Double longitude, Double radiusKm, int limit) {
+        requireValidCoordinates(latitude, longitude);
+        if (radiusKm == null || radiusKm <= 0) {
+            throw new IllegalArgumentException("radius must be greater than 0");
+        }
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be greater than 0");
+        }
+        // Cost grows with the number of drivers inside the circle, so callers cannot ask for an unbounded area.
+        double radius = Math.min(radiusKm, props.maxRadiusKm());
 
-        Distance circleRadius = new Distance(radius, Metrics.KILOMETERS);
+        // COUNT without ANY still scans the whole circle before trimming, so the radius cap matters more than the limit.
+        GeoSearchCommandArgs args = GeoSearchCommandArgs.newGeoSearchArgs()
+                .includeDistance()
+                .includeCoordinates()
+                .sortAscending()
+                .limit(limit);
 
-        Circle circle = new Circle(new Point(longitude, latitude), circleRadius);
+        GeoResults<GeoLocation<String>> results = searchTimer.record(() -> redis.opsForGeo().search(
+                GEO_KEY,
+                GeoReference.fromCoordinate(longitude, latitude),
+                new Distance(radius, Metrics.KILOMETERS),
+                args));
 
-        GeoResults<GeoLocation<String>> results = geoOperations.radius(DRIVER_GEO_OPS_KEY, circle); // query redis
-
-        List<DriverLocationDTO> driverLocations = new ArrayList<>();
-
-        for(GeoResult<GeoLocation<String>> result : results) {
-
-            Point point = geoOperations.position(DRIVER_GEO_OPS_KEY, result.getContent().getName()).get(0); // location of individual driver in redis
-
-            DriverLocationDTO driverLocation = DriverLocationDTO.builder()
-                    .driverId(Integer.parseInt(result.getContent().getName()))
+        List<DriverLocationDTO> drivers = new ArrayList<>();
+        if (results == null) {
+            return drivers;
+        }
+        for (GeoResult<GeoLocation<String>> result : results) {
+            GeoLocation<String> location = result.getContent();
+            Point point = location.getPoint();
+            drivers.add(DriverLocationDTO.builder()
+                    .driverId(Integer.parseInt(location.getName()))
                     .latitude(point.getY())
                     .longitude(point.getX())
-                    .build();
-
-            driverLocations.add(driverLocation);
+                    .distanceKm(result.getDistance().getValue())
+                    .build());
         }
+        return drivers;
+    }
 
-        return driverLocations;
+    @Override
+    public void removeDriver(Integer driverId) {
+        String member = driverId.toString();
+        redis.opsForGeo().remove(GEO_KEY, member);
+        redis.opsForZSet().remove(SEEN_KEY, member);
+    }
+
+    @Override
+    public long evictStaleDrivers(long lastSeenBeforeEpochMs) {
+        Set<String> stale = redis.opsForZSet().rangeByScore(SEEN_KEY, 0, lastSeenBeforeEpochMs, 0, EVICTION_BATCH_SIZE);
+        if (stale == null || stale.isEmpty()) {
+            return 0;
+        }
+        String[] members = stale.toArray(new String[0]);
+        redis.opsForGeo().remove(GEO_KEY, members);
+        redis.opsForZSet().remove(SEEN_KEY, (Object[]) members);
+        return members.length;
+    }
+
+    private static void requireValidCoordinates(Double latitude, Double longitude) {
+        if (latitude == null || longitude == null) {
+            throw new IllegalArgumentException("latitude and longitude are required");
+        }
+        if (latitude < -MAX_LATITUDE || latitude > MAX_LATITUDE || longitude < -180 || longitude > 180) {
+            throw new IllegalArgumentException("coordinates out of range: " + latitude + ", " + longitude);
+        }
     }
 }
-
-
-/**
- * - Booking creation flow
- *
- *  1. User requests a booking with their lat and long coordinate
- *  2. System should create a booking with pending status
- *  3. System should search for nearby drivers within a radius of X kilometers
- *  4. Once found we will raise a request to the drivers UI to check if they want to accept the booking
- *  5. Which ever driver accepts the booking, we will allot that driver to the booking and update the status to confirmed.
- *
- *  Note: During this process, while the drivers are checking the booking, the user should not be blocked, they will get a response
- * of booking is pending.
- */
